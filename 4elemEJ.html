@@ -1,0 +1,1574 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="application-version" content="0.8.0">
+    <title>4 Элемента: Поток Стихий</title>
+    <!--
+        v0.8.0 FINAL - 2026-08-15: финальная сборка всех этапов.
+        v0.8.0 - Added - фоновая амбиент-музыка.
+        v0.7.0 - Added - замороженные фишки (лёд) для Архимага.
+        v0.6.0 - Added - звук Web Audio API, кнопка 🔊/🔇.
+        v0.5.1 - Changed - фигуры заменены на эмодзи.
+        v0.5.0 - Added - сложности, таймер, очки, экран результатов.
+        v0.4.0 - Added - эффект "Поток Стихий".
+        v0.3.1 - Fixed - баг свайпов.
+        v0.3.0 - Added - Match-3 логика.
+        v0.2.0 - Added - адаптация экранов.
+        v0.1.0 - Added - базовый скелет.
+    -->
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html, body {
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a2e;
+            touch-action: none;
+            overscroll-behavior: none;
+            -webkit-overflow-scrolling: none;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            user-select: none;
+            -webkit-user-select: none;
+            -webkit-tap-highlight-color: transparent;
+        }
+        #gameCanvas {
+            display: block;
+            position: fixed;
+            top: 0;
+            left: 0;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="gameCanvas"></canvas>
+
+    <script>
+        // ==========================================================
+        // КОНФИГУРАЦИЯ
+        // ==========================================================
+        const CONFIG = {
+            ELEMENT_TYPES: 4,
+            MAX_CELL_SIZE: 70,
+            GRID_PADDING: 10,
+            SWAP_THRESHOLD: 20,
+            ANIMATION_SPEED: 8,
+            FLOW_HEAD_DURATION: 0.35,
+            FLOW_FADE_DURATION: 0.5,
+            ALTAR_PER_TILE: 0.02,
+            SCORE_PER_TILE: 10,
+            END_DELAY: 1.2,
+            FROZEN_LEVEL_MAX: 2,
+            COLORS: {
+                FIRE: '#ff4d4d',
+                WATER: '#4d94ff',
+                EARTH: '#4dff88',
+                AIR: '#e6e6fa'
+            },
+            BG_COLOR: '#1a1a2e',
+            EMOJIS: ['🔥', '💧', '🌿', '🌪️'],
+            GLOW_COLORS: ['#ff4d4d', '#4d94ff', '#4dff88', '#c3b3ff']
+        };
+
+        const ELEMENTS = { FIRE: 0, WATER: 1, EARTH: 2, AIR: 3 };
+
+        const BOARD_STATE = {
+            IDLE: 'idle',
+            SWAPPING: 'swapping',
+            RESOLVING: 'resolving',
+            CHECKING: 'checking'
+        };
+
+        // ==========================================================
+        // СЛОЖНОСТИ
+        // ==========================================================
+        const DIFFICULTY = {
+            APPRENTICE: {
+                key: 'APPRENTICE', name: 'Ученик',
+                desc: 'Без времени · Набрать 1500 очков',
+                timeLimit: 0, goal: 'score', targetScore: 1500,
+                gridSize: 8, frozenTiles: 0, color: '#4dff88'
+            },
+            MAGE: {
+                key: 'MAGE', name: 'Маг',
+                desc: '90 сек · Заполнить Алтарь',
+                timeLimit: 90, goal: 'altar', targetScore: 0,
+                gridSize: 8, frozenTiles: 0, color: '#4d94ff'
+            },
+            ARCHMAGE: {
+                key: 'ARCHMAGE', name: 'Архимаг',
+                desc: '60 сек · 9×9 · Лёд ×8',
+                timeLimit: 60, goal: 'altar', targetScore: 0,
+                gridSize: 9, frozenTiles: 8, color: '#ff4d4d'
+            }
+        };
+
+        // ==========================================================
+        // VIEWPORT (HiDPI, ориентация)
+        // ==========================================================
+        const Viewport = {
+            width: 0, height: 0, dpr: 1, isPortrait: true,
+            canvas: null, ctx: null, onResize: null,
+
+            init(canvas) {
+                this.canvas = canvas;
+                this.ctx = canvas.getContext('2d');
+                this.resize();
+                window.addEventListener('resize', () => this.resize());
+                window.addEventListener('orientationchange', () => {
+                    setTimeout(() => this.resize(), 150);
+                });
+            },
+
+            resize() {
+                this.dpr = Math.min(window.devicePixelRatio || 1, 3);
+                this.width = window.innerWidth;
+                this.height = window.innerHeight;
+                this.isPortrait = this.height >= this.width;
+
+                this.canvas.width = Math.floor(this.width * this.dpr);
+                this.canvas.height = Math.floor(this.height * this.dpr);
+                this.canvas.style.width = this.width + 'px';
+                this.canvas.style.height = this.height + 'px';
+                this.ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+
+                if (this.onResize) this.onResize(this.width, this.height);
+            },
+
+            get minDimension() { return Math.min(this.width, this.height); },
+            get hudHeight() { return Math.max(88, Math.floor(this.height * 0.13)); },
+            get altarBarHeight() { return Math.max(26, Math.floor(this.hudHeight * 0.34)); }
+        };
+
+        // ==========================================================
+        // АУДИО-СИСТЕМА: синтез через Web Audio API
+        // ==========================================================
+        const AudioSys = {
+            ctx: null,
+            masterGain: null,
+            enabled: true,
+            MASTER_VOLUME: 0.3,
+
+            // AudioContext создаётся/возобновляется только по жесту пользователя
+            init() {
+                if (this.ctx) {
+                    if (this.ctx.state === 'suspended') this.ctx.resume();
+                    if (this.enabled) MusicSys.start();
+                    return;
+                }
+                try {
+                    const AC = window.AudioContext || window.webkitAudioContext;
+                    if (!AC) return;
+                    this.ctx = new AC();
+                    this.masterGain = this.ctx.createGain();
+                    this.masterGain.gain.value = this.MASTER_VOLUME;
+                    this.masterGain.connect(this.ctx.destination);
+                    try {
+                        if (localStorage.getItem('sound_enabled') === '0') {
+                            this.enabled = false;
+                            this.masterGain.gain.value = 0;
+                        }
+                    } catch (e) {}
+                    if (this.enabled) MusicSys.start();
+                } catch (e) {
+                    console.warn('Web Audio API недоступен:', e);
+                }
+            },
+
+            toggle() {
+                this.enabled = !this.enabled;
+                if (this.masterGain) {
+                    this.masterGain.gain.value = this.enabled ? this.MASTER_VOLUME : 0;
+                }
+                if (this.enabled) MusicSys.start();
+                else MusicSys.stop();
+                try {
+                    localStorage.setItem('sound_enabled', this.enabled ? '1' : '0');
+                } catch (e) {}
+                if (this.enabled) this.playTap();
+            },
+
+            tone(freq, opts = {}) {
+                if (!this.ctx || !this.enabled) return;
+                const {
+                    type = 'sine', duration = 0.2, volume = 0.5,
+                    delay = 0, slideTo = null
+                } = opts;
+
+                const t0 = this.ctx.currentTime + delay;
+                const osc = this.ctx.createOscillator();
+                const gain = this.ctx.createGain();
+
+                osc.type = type;
+                osc.frequency.setValueAtTime(freq, t0);
+                if (slideTo) {
+                    osc.frequency.exponentialRampToValueAtTime(slideTo, t0 + duration);
+                }
+
+                gain.gain.setValueAtTime(0, t0);
+                gain.gain.linearRampToValueAtTime(volume, t0 + 0.012);
+                gain.gain.exponentialRampToValueAtTime(0.001, t0 + duration);
+
+                osc.connect(gain);
+                gain.connect(this.masterGain);
+                osc.start(t0);
+                osc.stop(t0 + duration + 0.05);
+            },
+
+            playTap() {
+                this.tone(650, { type: 'sine', duration: 0.06, volume: 0.25 });
+            },
+            playSwap() {
+                this.tone(280, { type: 'sine', duration: 0.09, volume: 0.3, slideTo: 440 });
+            },
+            playRevert() {
+                this.tone(220, { type: 'square', duration: 0.16, volume: 0.15, slideTo: 110 });
+            },
+            playIceCrack() {
+                this.tone(900, { type: 'square', duration: 0.1, volume: 0.3, slideTo: 180 });
+                this.tone(1500, { type: 'sine', duration: 0.07, volume: 0.2, delay: 0.02 });
+            },
+            playFrozenSwap() {
+                this.tone(110, { type: 'sine', duration: 0.12, volume: 0.4 });
+            },
+            playMatch(cascade = 1) {
+                const shift = Math.pow(1.26, Math.min(cascade - 1, 4));
+                const base = 330 * shift;
+                [1, 1.25, 1.5, 2].forEach((mult, i) => {
+                    this.tone(base * mult, {
+                        type: 'triangle', duration: 0.22,
+                        volume: 0.4, delay: i * 0.06
+                    });
+                });
+                if (cascade >= 2) {
+                    this.tone(base * 3, { type: 'sine', duration: 0.35, volume: 0.2, delay: 0.24 });
+                }
+            },
+            playVictory() {
+                [523.25, 659.25, 783.99, 1046.5].forEach((f, i) => {
+                    this.tone(f, { type: 'triangle', duration: 0.35, volume: 0.45, delay: i * 0.14 });
+                });
+            },
+            playDefeat() {
+                [392, 329.63, 261.63, 196].forEach((f, i) => {
+                    this.tone(f, { type: 'sawtooth', duration: 0.35, volume: 0.2, delay: i * 0.18 });
+                });
+            }
+        };
+
+        // ==========================================================
+        // МУЗЫКА: генеративный эмбиент на пентатонике
+        // ==========================================================
+        const MusicSys = {
+            playing: false,
+            timer: null,
+            nextStepTime: 0,
+            stepIndex: 0,
+            STEP_DURATION: 2.0,
+            MUSIC_VOLUME: 0.16,
+            musicGain: null,
+
+            SCALE: [220, 261.63, 293.66, 329.63, 392, 440, 523.25, 587.33, 659.25],
+
+            ensureGain() {
+                if (!AudioSys.ctx || this.musicGain) return;
+                this.musicGain = AudioSys.ctx.createGain();
+                this.musicGain.gain.value = this.MUSIC_VOLUME;
+                this.musicGain.connect(AudioSys.masterGain);
+            },
+
+            start() {
+                if (!AudioSys.ctx || this.playing) return;
+                this.ensureGain();
+                this.playing = true;
+                this.nextStepTime = AudioSys.ctx.currentTime + 0.2;
+                this.scheduler();
+            },
+
+            stop() {
+                this.playing = false;
+                if (this.timer) {
+                    clearTimeout(this.timer);
+                    this.timer = null;
+                }
+            },
+
+            // Look-ahead планировщик: стабильный темп под нагрузкой
+            scheduler() {
+                if (!this.playing) return;
+                const lookAhead = 1.0;
+                while (this.nextStepTime < AudioSys.ctx.currentTime + lookAhead) {
+                    this.scheduleStep(this.stepIndex, this.nextStepTime);
+                    this.nextStepTime += this.STEP_DURATION;
+                    this.stepIndex++;
+                }
+                this.timer = setTimeout(() => this.scheduler(), 250);
+            },
+
+            scheduleStep(step, time) {
+                if (step % 2 === 0 && Math.random() < 0.75) {
+                    const freq = this.SCALE[Utils.randInt(0, this.SCALE.length - 1)];
+                    this.pad(freq, time, 5.5);
+                    if (Math.random() < 0.3) {
+                        this.pad(freq * 2, time + 0.8, 4);
+                    }
+                }
+                if (step % 8 === 0) {
+                    this.drone(110, time, 14);
+                }
+            },
+
+            pad(freq, time, duration) {
+                const attack = 1.6;
+                const release = 2.0;
+                const g = AudioSys.ctx.createGain();
+                g.connect(this.musicGain);
+                g.gain.setValueAtTime(0, time);
+                g.gain.linearRampToValueAtTime(0.4, time + attack);
+                g.gain.setValueAtTime(0.4, time + duration - release);
+                g.gain.linearRampToValueAtTime(0, time + duration);
+
+                [-3, 3].forEach(detune => {
+                    const osc = AudioSys.ctx.createOscillator();
+                    osc.type = 'sine';
+                    osc.frequency.value = freq;
+                    osc.detune.value = detune;
+                    osc.connect(g);
+                    osc.start(time);
+                    osc.stop(time + duration + 0.1);
+                });
+            },
+
+            drone(freq, time, duration) {
+                const g = AudioSys.ctx.createGain();
+                g.connect(this.musicGain);
+                g.gain.setValueAtTime(0, time);
+                g.gain.linearRampToValueAtTime(0.35, time + 3);
+                g.gain.setValueAtTime(0.35, time + duration - 4);
+                g.gain.linearRampToValueAtTime(0, time + duration);
+
+                const osc = AudioSys.ctx.createOscillator();
+                osc.type = 'triangle';
+                osc.frequency.value = freq;
+                osc.connect(g);
+                osc.start(time);
+                osc.stop(time + duration + 0.1);
+            }
+        };
+
+        // ==========================================================
+        // УТИЛИТЫ
+        // ==========================================================
+        const Utils = {
+            randInt: (min, max) => Math.floor(Math.random() * (max - min + 1)) + min,
+            clearScreen(ctx) {
+                ctx.fillStyle = CONFIG.BG_COLOR;
+                ctx.fillRect(0, 0, Viewport.width, Viewport.height);
+            },
+            hitRect(x, y, r) {
+                return x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+            }
+        };
+
+        function getAltarGeometry() {
+            const hudPad = CONFIG.GRID_PADDING;
+            const altarH = Viewport.altarBarHeight;
+            const btnSize = altarH;
+            const gap = 8;
+            const altarW = Viewport.width - hudPad * 2 - btnSize - gap;
+            return {
+                x: hudPad, y: hudPad, w: altarW, h: altarH,
+                btnX: hudPad + altarW + gap, btnY: hudPad, btnSize
+            };
+        }
+
+        // ==========================================================
+        // ФИШКА
+        // ==========================================================
+        class Tile {
+            constructor(type, row, col) {
+                this.type = type;
+                this.row = row;
+                this.col = col;
+                this.visualRow = row;
+                this.visualCol = col;
+                this.scale = 1;
+                this.targetScale = 1;
+                this.isMatched = false;
+                this.frozenLevel = 0;
+                this.flash = 0;
+            }
+        }
+
+        // ==========================================================
+        // ПОТОК: светящаяся линия вдоль матча
+        // ==========================================================
+        class Flow {
+            constructor(path, color, system) {
+                this.path = path;
+                this.color = color;
+                this.system = system;
+                this.progress = 0;
+                this.fade = 1;
+                this.phase = 'flowing';
+                this.totalLength = this.calcLength();
+                this.dead = false;
+            }
+
+            calcLength() {
+                let len = 0;
+                for (let i = 1; i < this.path.length; i++) {
+                    len += Math.hypot(
+                        this.path[i].x - this.path[i - 1].x,
+                        this.path[i].y - this.path[i - 1].y
+                    );
+                }
+                return len;
+            }
+
+            pointAt(t) {
+                const target = t * this.totalLength;
+                let acc = 0;
+                for (let i = 1; i < this.path.length; i++) {
+                    const segLen = Math.hypot(
+                        this.path[i].x - this.path[i - 1].x,
+                        this.path[i].y - this.path[i - 1].y
+                    );
+                    if (acc + segLen >= target) {
+                        const local = (target - acc) / (segLen || 1);
+                        return {
+                            x: this.path[i - 1].x + (this.path[i].x - this.path[i - 1].x) * local,
+                            y: this.path[i - 1].y + (this.path[i].y - this.path[i - 1].y) * local
+                        };
+                    }
+                    acc += segLen;
+                }
+                return this.path[this.path.length - 1];
+            }
+
+            update(dt) {
+                if (this.phase === 'flowing') {
+                    this.progress += dt / CONFIG.FLOW_HEAD_DURATION;
+                    const head = this.pointAt(Math.min(1, this.progress));
+                    this.system.spawnParticles(head.x, head.y, this.color, 2);
+                    if (this.progress >= 1) this.phase = 'fading';
+                } else {
+                    this.fade -= dt / CONFIG.FLOW_FADE_DURATION;
+                    if (this.fade <= 0) {
+                        this.fade = 0;
+                        this.dead = true;
+                    }
+                }
+            }
+
+            draw(ctx) {
+                const headT = Math.min(1, this.progress);
+                if (headT <= 0) return;
+
+                ctx.save();
+                ctx.globalAlpha = this.phase === 'fading' ? this.fade : 1;
+                ctx.strokeStyle = this.color;
+                ctx.lineWidth = 4;
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.shadowBlur = 12;
+                ctx.shadowColor = this.color;
+
+                ctx.beginPath();
+                ctx.moveTo(this.path[0].x, this.path[0].y);
+                let acc = 0;
+                const target = headT * this.totalLength;
+                for (let i = 1; i < this.path.length; i++) {
+                    const segLen = Math.hypot(
+                        this.path[i].x - this.path[i - 1].x,
+                        this.path[i].y - this.path[i - 1].y
+                    );
+                    if (acc + segLen >= target) {
+                        const head = this.pointAt(headT);
+                        ctx.lineTo(head.x, head.y);
+                        break;
+                    } else {
+                        ctx.lineTo(this.path[i].x, this.path[i].y);
+                        acc += segLen;
+                    }
+                }
+                ctx.stroke();
+
+                if (this.phase === 'flowing') {
+                    const head = this.pointAt(headT);
+                    ctx.fillStyle = '#ffffff';
+                    ctx.beginPath();
+                    ctx.arc(head.x, head.y, 5, 0, Math.PI * 2);
+                    ctx.fill();
+                }
+                ctx.restore();
+            }
+        }
+
+        // ==========================================================
+        // СИСТЕМА ПОТОКА: эффекты + частицы + Алтарь
+        // ==========================================================
+        class FlowSystem {
+            constructor() {
+                this.flows = [];
+                this.particles = [];
+                this.altarProgress = 0;
+                this.altarX = 0;
+                this.altarY = 0;
+                this.updateAltarPosition();
+            }
+
+            updateAltarPosition() {
+                const g = getAltarGeometry();
+                this.altarX = g.x + g.w / 2;
+                this.altarY = g.y + g.h / 2;
+            }
+
+            colorFor(type) {
+                switch (type) {
+                    case ELEMENTS.FIRE: return CONFIG.COLORS.FIRE;
+                    case ELEMENTS.WATER: return CONFIG.COLORS.WATER;
+                    case ELEMENTS.EARTH: return CONFIG.COLORS.EARTH;
+                    case ELEMENTS.AIR: return CONFIG.COLORS.AIR;
+                }
+                return '#ffffff';
+            }
+
+            spawnLines(lines, board) {
+                lines.forEach(line => {
+                    if (line.length < 2) return;
+                    const path = line.map(tile => ({
+                        x: board.offsetX + (tile.col + 0.5) * board.cellSize,
+                        y: board.offsetY + (tile.row + 0.5) * board.cellSize
+                    }));
+                    const color = this.colorFor(line[0].type);
+                    this.flows.push(new Flow(path, color, this));
+                    this.altarProgress = Math.min(1,
+                        this.altarProgress + line.length * CONFIG.ALTAR_PER_TILE);
+                });
+            }
+
+            spawnParticles(x, y, color, count) {
+                for (let i = 0; i < count; i++) {
+                    this.particles.push({
+                        x: x + (Math.random() - 0.5) * 10,
+                        y: y + (Math.random() - 0.5) * 10,
+                        color: color,
+                        life: 1,
+                        speed: 0.6 + Math.random() * 0.6
+                    });
+                }
+            }
+
+            update(deltaTime) {
+                const dt = deltaTime / 1000;
+
+                for (let i = this.flows.length - 1; i >= 0; i--) {
+                    this.flows[i].update(dt);
+                    if (this.flows[i].dead) this.flows.splice(i, 1);
+                }
+
+                for (let i = this.particles.length - 1; i >= 0; i--) {
+                    const p = this.particles[i];
+                    const dx = this.altarX - p.x;
+                    const dy = this.altarY - p.y;
+                    const dist = Math.hypot(dx, dy) || 1;
+                    const vel = 320 * p.speed * dt;
+                    p.x += (dx / dist) * vel;
+                    p.y += (dy / dist) * vel;
+                    p.life -= dt * 1.1;
+                    if (p.life <= 0 || dist < 18) this.particles.splice(i, 1);
+                }
+            }
+
+            draw(ctx) {
+                this.flows.forEach(f => f.draw(ctx));
+
+                this.particles.forEach(p => {
+                    ctx.globalAlpha = Math.max(0, p.life);
+                    ctx.fillStyle = p.color;
+                    ctx.shadowBlur = 8;
+                    ctx.shadowColor = p.color;
+                    ctx.beginPath();
+                    ctx.arc(p.x, p.y, 3, 0, Math.PI * 2);
+                    ctx.fill();
+                });
+                ctx.globalAlpha = 1;
+                ctx.shadowBlur = 0;
+            }
+        }
+
+        // ==========================================================
+        // ИГРОВОЕ ПОЛЕ: Match-3 + лёд + гравитация
+        // ==========================================================
+        class Board {
+            constructor(size, frozenCount = 0) {
+                this.size = size;
+                this.grid = [];
+                this.cellSize = 0;
+                this.offsetX = 0;
+                this.offsetY = 0;
+                this.state = BOARD_STATE.IDLE;
+                this.lastSwap = null;
+                this.selectedCell = null;
+                this.onMatchLines = null;
+                this.cascadeCount = 0;
+                this.hadRemovals = false;
+                this.generateGrid();
+                if (frozenCount > 0) this.freezeRandomTiles(frozenCount);
+            }
+
+            generateGrid() {
+                this.grid = [];
+                for (let r = 0; r < this.size; r++) {
+                    this.grid[r] = [];
+                    for (let c = 0; c < this.size; c++) {
+                        let type;
+                        do {
+                            type = Utils.randInt(0, CONFIG.ELEMENT_TYPES - 1);
+                        } while (this.wouldMatch(r, c, type));
+                        this.grid[r][c] = new Tile(type, r, c);
+                    }
+                }
+            }
+
+            freezeRandomTiles(count) {
+                const cells = [];
+                for (let r = 0; r < this.size; r++) {
+                    for (let c = 0; c < this.size; c++) {
+                        cells.push({ r, c });
+                    }
+                }
+                for (let i = cells.length - 1; i > 0; i--) {
+                    const j = Utils.randInt(0, i);
+                    [cells[i], cells[j]] = [cells[j], cells[i]];
+                }
+                for (let i = 0; i < Math.min(count, cells.length); i++) {
+                    const { r, c } = cells[i];
+                    this.grid[r][c].frozenLevel = CONFIG.FROZEN_LEVEL_MAX;
+                }
+            }
+
+            countFrozen() {
+                let n = 0;
+                for (let r = 0; r < this.size; r++) {
+                    for (let c = 0; c < this.size; c++) {
+                        const t = this.grid[r][c];
+                        if (t && t.frozenLevel > 0) n++;
+                    }
+                }
+                return n;
+            }
+
+            wouldMatch(row, col, type) {
+                if (col >= 2 &&
+                    this.grid[row][col - 1] && this.grid[row][col - 1].type === type &&
+                    this.grid[row][col - 2] && this.grid[row][col - 2].type === type) {
+                    return true;
+                }
+                if (row >= 2 &&
+                    this.grid[row - 1] && this.grid[row - 1][col] && this.grid[row - 1][col].type === type &&
+                    this.grid[row - 2] && this.grid[row - 2][col] && this.grid[row - 2][col].type === type) {
+                    return true;
+                }
+                return false;
+            }
+
+            calculateLayout() {
+                const hudHeight = Viewport.hudHeight;
+                const padding = CONFIG.GRID_PADDING;
+                const availableWidth = Viewport.width - padding * 2;
+                const availableHeight = Viewport.height - hudHeight - padding * 2;
+                let cellSize = Math.min(availableWidth, availableHeight) / this.size;
+                cellSize = Math.min(cellSize, CONFIG.MAX_CELL_SIZE);
+                this.cellSize = cellSize;
+                const boardSize = cellSize * this.size;
+                this.offsetX = (Viewport.width - boardSize) / 2;
+                this.offsetY = hudHeight + (Viewport.height - hudHeight - boardSize) / 2;
+            }
+
+            isValidCell(row, col) {
+                return row >= 0 && row < this.size && col >= 0 && col < this.size;
+            }
+
+            getCellFromPoint(x, y) {
+                const col = Math.floor((x - this.offsetX) / this.cellSize);
+                const row = Math.floor((y - this.offsetY) / this.cellSize);
+                if (this.isValidCell(row, col)) return { row, col };
+                return null;
+            }
+
+            swapTiles(r1, c1, r2, c2, isRevert = false) {
+                const tile1 = this.grid[r1][c1];
+                const tile2 = this.grid[r2][c2];
+                if (!tile1 || !tile2) return;
+
+                if (!isRevert && (tile1.frozenLevel > 0 || tile2.frozenLevel > 0)) {
+                    AudioSys.playFrozenSwap();
+                    return;
+                }
+
+                this.grid[r1][c1] = tile2;
+                this.grid[r2][c2] = tile1;
+
+                tile1.row = r2; tile1.col = c2;
+                tile2.row = r1; tile2.col = c1;
+
+                if (!isRevert) {
+                    this.cascadeCount = 0;
+                    AudioSys.playSwap();
+                }
+                this.lastSwap = { r1, c1, r2, c2, isRevert };
+                this.state = BOARD_STATE.SWAPPING;
+            }
+
+            findMatches() {
+                const matches = new Set();
+
+                for (let r = 0; r < this.size; r++) {
+                    let c = 0;
+                    while (c < this.size - 2) {
+                        const tile = this.grid[r][c];
+                        if (!tile) { c++; continue; }
+                        const type = tile.type;
+                        let matchLength = 1;
+                        while (c + matchLength < this.size &&
+                               this.grid[r][c + matchLength] &&
+                               this.grid[r][c + matchLength].type === type) {
+                            matchLength++;
+                        }
+                        if (matchLength >= 3) {
+                            for (let i = 0; i < matchLength; i++) matches.add(this.grid[r][c + i]);
+                        }
+                        c += matchLength;
+                    }
+                }
+
+                for (let c = 0; c < this.size; c++) {
+                    let r = 0;
+                    while (r < this.size - 2) {
+                        const tile = this.grid[r][c];
+                        if (!tile) { r++; continue; }
+                        const type = tile.type;
+                        let matchLength = 1;
+                        while (r + matchLength < this.size &&
+                               this.grid[r + matchLength][c] &&
+                               this.grid[r + matchLength][c].type === type) {
+                            matchLength++;
+                        }
+                        if (matchLength >= 3) {
+                            for (let i = 0; i < matchLength; i++) matches.add(this.grid[r + i][c]);
+                        }
+                        r += matchLength;
+                    }
+                }
+
+                return Array.from(matches);
+            }
+
+            findMatchLines() {
+                const lines = [];
+                for (let r = 0; r < this.size; r++) {
+                    let c = 0;
+                    while (c < this.size - 2) {
+                        const tile = this.grid[r][c];
+                        if (!tile) { c++; continue; }
+                        const type = tile.type;
+                        const run = [tile];
+                        let k = c + 1;
+                        while (k < this.size && this.grid[r][k] && this.grid[r][k].type === type) {
+                            run.push(this.grid[r][k]);
+                            k++;
+                        }
+                        if (run.length >= 3) lines.push(run);
+                        c = k;
+                    }
+                }
+                for (let c = 0; c < this.size; c++) {
+                    let r = 0;
+                    while (r < this.size - 2) {
+                        const tile = this.grid[r][c];
+                        if (!tile) { r++; continue; }
+                        const type = tile.type;
+                        const run = [tile];
+                        let k = r + 1;
+                        while (k < this.size && this.grid[k][c] && this.grid[k][c].type === type) {
+                            run.push(this.grid[k][c]);
+                            k++;
+                        }
+                        if (run.length >= 3) lines.push(run);
+                        r = k;
+                    }
+                }
+                return lines;
+            }
+
+            startResolving(matches) {
+                this.state = BOARD_STATE.RESOLVING;
+                this.cascadeCount++;
+                let iceHit = false;
+                let removed = false;
+
+                matches.forEach(tile => {
+                    if (tile.frozenLevel > 0) {
+                        tile.frozenLevel--;
+                        tile.flash = 1;
+                        iceHit = true;
+                    } else {
+                        tile.isMatched = true;
+                        tile.targetScale = 0;
+                        removed = true;
+                    }
+                });
+
+                this.hadRemovals = removed;
+
+                if (this.onMatchLines) {
+                    this.onMatchLines(this.findMatchLines(), this.cascadeCount);
+                }
+                AudioSys.playMatch(this.cascadeCount);
+                if (iceHit) AudioSys.playIceCrack();
+            }
+
+            applyGravity() {
+                for (let c = 0; c < this.size; c++) {
+                    let emptyRow = this.size - 1;
+                    for (let r = this.size - 1; r >= 0; r--) {
+                        const tile = this.grid[r][c];
+                        if (tile && tile.frozenLevel > 0) {
+                            emptyRow = r - 1;
+                            continue;
+                        }
+                        if (tile !== null) {
+                            if (r !== emptyRow) {
+                                this.grid[emptyRow][c] = tile;
+                                this.grid[r][c] = null;
+                                tile.row = emptyRow;
+                                tile.col = c;
+                            }
+                            emptyRow--;
+                        }
+                    }
+                }
+            }
+
+            fillEmpty() {
+                for (let c = 0; c < this.size; c++) {
+                    let frozenRow = -1;
+                    for (let r = 0; r < this.size; r++) {
+                        const t = this.grid[r][c];
+                        if (t && t.frozenLevel > 0) { frozenRow = r; break; }
+                    }
+
+                    let spawnOffset = 0;
+                    for (let r = 0; r < this.size; r++) {
+                        if (this.grid[r][c] === null) {
+                            const type = Utils.randInt(0, CONFIG.ELEMENT_TYPES - 1);
+                            const tile = new Tile(type, r, c);
+                            if (frozenRow !== -1 && r > frozenRow) {
+                                tile.visualRow = r;
+                                tile.scale = 0;
+                                tile.targetScale = 1;
+                            } else {
+                                tile.visualRow = -1 - spawnOffset;
+                            }
+                            this.grid[r][c] = tile;
+                            spawnOffset++;
+                        }
+                    }
+                }
+            }
+
+            isAnimationComplete() {
+                for (let r = 0; r < this.size; r++) {
+                    for (let c = 0; c < this.size; c++) {
+                        const tile = this.grid[r][c];
+                        if (!tile) continue;
+                        if (Math.abs(tile.visualRow - tile.row) > 0.01 ||
+                            Math.abs(tile.visualCol - tile.col) > 0.01 ||
+                            Math.abs(tile.scale - tile.targetScale) > 0.01) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            }
+
+            updateAnimations(deltaTime) {
+                const lerpFactor = Math.min(1, CONFIG.ANIMATION_SPEED * deltaTime / 1000);
+                for (let r = 0; r < this.size; r++) {
+                    for (let c = 0; c < this.size; c++) {
+                        const tile = this.grid[r][c];
+                        if (!tile) continue;
+                        tile.visualRow += (tile.row - tile.visualRow) * lerpFactor;
+                        tile.visualCol += (tile.col - tile.visualCol) * lerpFactor;
+                        tile.scale += (tile.targetScale - tile.scale) * lerpFactor;
+                        if (tile.flash > 0) {
+                            tile.flash = Math.max(0, tile.flash - deltaTime / 300);
+                        }
+                    }
+                }
+            }
+
+            updateStateMachine() {
+                switch (this.state) {
+                    case BOARD_STATE.SWAPPING:
+                        if (this.isAnimationComplete()) {
+                            if (this.lastSwap && this.lastSwap.isRevert) {
+                                this.state = BOARD_STATE.IDLE;
+                                this.lastSwap = null;
+                            } else {
+                                const matches = this.findMatches();
+                                if (matches.length > 0) {
+                                    this.startResolving(matches);
+                                } else {
+                                    AudioSys.playRevert();
+                                    const { r1, c1, r2, c2 } = this.lastSwap;
+                                    this.swapTiles(r1, c1, r2, c2, true);
+                                }
+                            }
+                        }
+                        break;
+
+                    case BOARD_STATE.RESOLVING:
+                        if (this.isAnimationComplete()) {
+                            for (let r = 0; r < this.size; r++) {
+                                for (let c = 0; c < this.size; c++) {
+                                    if (this.grid[r][c] && this.grid[r][c].isMatched) {
+                                        this.grid[r][c] = null;
+                                    }
+                                }
+                            }
+                            this.applyGravity();
+                            this.fillEmpty();
+                            this.state = this.hadRemovals
+                                ? BOARD_STATE.CHECKING
+                                : BOARD_STATE.IDLE;
+                        }
+                        break;
+
+                    case BOARD_STATE.CHECKING:
+                        if (this.isAnimationComplete()) {
+                            const matches = this.findMatches();
+                            if (matches.length > 0) {
+                                this.startResolving(matches);
+                            } else {
+                                this.state = BOARD_STATE.IDLE;
+                            }
+                        }
+                        break;
+                }
+            }
+
+            update(deltaTime) {
+                this.updateAnimations(deltaTime);
+                this.updateStateMachine();
+            }
+
+            draw(ctx) {
+                if (this.selectedCell) {
+                    const { row, col } = this.selectedCell;
+                    const x = this.offsetX + col * this.cellSize;
+                    const y = this.offsetY + row * this.cellSize;
+                    ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+                    ctx.fillRect(x, y, this.cellSize, this.cellSize);
+                }
+
+                for (let r = 0; r < this.size; r++) {
+                    for (let c = 0; c < this.size; c++) {
+                        const tile = this.grid[r][c];
+                        if (!tile) continue;
+                        const x = this.offsetX + tile.visualCol * this.cellSize;
+                        const y = this.offsetY + tile.visualRow * this.cellSize;
+                        this.drawTile(ctx, tile, x, y);
+                    }
+                }
+            }
+
+            drawTile(ctx, tile, x, y) {
+                const centerX = x + this.cellSize / 2;
+                const centerY = y + this.cellSize / 2;
+                const glowColor = CONFIG.GLOW_COLORS[tile.type];
+
+                ctx.save();
+                ctx.translate(centerX, centerY);
+                ctx.scale(tile.scale, tile.scale);
+
+                ctx.shadowBlur = this.cellSize * 0.25;
+                ctx.shadowColor = glowColor;
+                ctx.font = `${Math.floor(this.cellSize * 0.6)}px "Noto Color Emoji", "Segoe UI Emoji", Arial, sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(CONFIG.EMOJIS[tile.type], 0, this.cellSize * 0.04);
+
+                ctx.shadowBlur = 0;
+
+                const s = this.cellSize * 0.46;
+                if (tile.frozenLevel > 0) {
+                    ctx.fillStyle = tile.frozenLevel >= 2
+                        ? 'rgba(160, 210, 255, 0.55)'
+                        : 'rgba(160, 210, 255, 0.28)';
+                    ctx.fillRect(-s, -s, s * 2, s * 2);
+
+                    ctx.strokeStyle = 'rgba(220, 240, 255, 0.9)';
+                    ctx.lineWidth = Math.max(1.5, this.cellSize * 0.04);
+                    ctx.strokeRect(-s, -s, s * 2, s * 2);
+
+                    if (tile.frozenLevel === 1) {
+                        ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+                        ctx.lineWidth = Math.max(1, this.cellSize * 0.03);
+                        ctx.beginPath();
+                        ctx.moveTo(-s * 0.6, -s * 0.5);
+                        ctx.lineTo(-s * 0.1, 0);
+                        ctx.lineTo(-s * 0.4, s * 0.55);
+                        ctx.moveTo(s * 0.55, -s * 0.55);
+                        ctx.lineTo(s * 0.1, -s * 0.05);
+                        ctx.lineTo(s * 0.45, s * 0.35);
+                        ctx.stroke();
+                    } else {
+                        ctx.font = `${Math.floor(this.cellSize * 0.35)}px Arial`;
+                        ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
+                        ctx.fillText('❄', 0, 0);
+                    }
+                }
+
+                if (tile.flash > 0) {
+                    ctx.globalAlpha = tile.flash * 0.6;
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillRect(-s, -s, s * 2, s * 2);
+                    ctx.globalAlpha = 1;
+                }
+
+                ctx.restore();
+            }
+        }
+
+        // ==========================================================
+        // СОСТОЯНИЯ
+        // ==========================================================
+        class GameState {
+            update(deltaTime) {}
+            draw(ctx) {}
+        }
+
+        class MenuState extends GameState {
+            constructor() {
+                super();
+                this.onSelectDifficulty = null;
+            }
+
+            getButtons() {
+                const base = Viewport.minDimension;
+                const bw = Math.min(Viewport.width * 0.78, 360);
+                const bh = Math.max(54, Math.floor(base * 0.085));
+                const gap = Math.floor(bh * 0.35);
+                const cx = Viewport.width / 2;
+                return ['APPRENTICE', 'MAGE', 'ARCHMAGE'].map((key, i) => ({
+                    key,
+                    cfg: DIFFICULTY[key],
+                    x: cx - bw / 2,
+                    y: Viewport.height * 0.42 + i * (bh + gap),
+                    w: bw,
+                    h: bh
+                }));
+            }
+
+            handleTap(x, y) {
+                for (const btn of this.getButtons()) {
+                    if (Utils.hitRect(x, y, btn)) {
+                        AudioSys.playTap();
+                        if (this.onSelectDifficulty) this.onSelectDifficulty(btn.key);
+                        return;
+                    }
+                }
+            }
+
+            drawButton(ctx, btn) {
+                ctx.fillStyle = 'rgba(44, 44, 68, 0.9)';
+                ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+                ctx.strokeStyle = btn.cfg.color;
+                ctx.lineWidth = 2;
+                ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+
+                ctx.fillStyle = btn.cfg.color;
+                ctx.font = `bold ${Math.floor(btn.h * 0.34)}px Arial`;
+                ctx.fillText(btn.cfg.name, btn.x + btn.w / 2, btn.y + btn.h * 0.34);
+
+                ctx.fillStyle = '#cccccc';
+                ctx.font = `${Math.floor(btn.h * 0.22)}px Arial`;
+                ctx.fillText(btn.cfg.desc, btn.x + btn.w / 2, btn.y + btn.h * 0.72);
+
+                ctx.textBaseline = 'alphabetic';
+            }
+
+            draw(ctx) {
+                Utils.clearScreen(ctx);
+                const base = Viewport.minDimension;
+                const cx = Viewport.width / 2;
+
+                ctx.textAlign = 'center';
+                ctx.fillStyle = '#ffffff';
+                ctx.font = `bold ${Math.floor(base * 0.09)}px Arial`;
+                ctx.fillText('4 ЭЛЕМЕНТА', cx, Viewport.height * 0.15);
+
+                ctx.fillStyle = '#aaaaaa';
+                ctx.font = `${Math.floor(base * 0.04)}px Arial`;
+                ctx.fillText('Поток Стихий', cx, Viewport.height * 0.15 + base * 0.07);
+
+                ctx.fillStyle = '#8888aa';
+                ctx.font = `${Math.floor(base * 0.035)}px Arial`;
+                ctx.fillText('Выберите сложность', cx, Viewport.height * 0.34);
+
+                this.getButtons().forEach(btn => this.drawButton(ctx, btn));
+            }
+        }
+
+        class PlayState extends GameState {
+            constructor(difficulty) {
+                super();
+                this.difficulty = difficulty;
+                this.board = new Board(difficulty.gridSize, difficulty.frozenTiles || 0);
+                this.board.calculateLayout();
+                this.flowSystem = new FlowSystem();
+                this.score = 0;
+                this.elapsed = 0;
+                this.timeRemaining = difficulty.timeLimit;
+                this.ended = false;
+                this.victory = false;
+                this.endTimer = 0;
+                this.onGameEnd = null;
+
+                this.board.onMatchLines = (lines, cascade) => {
+                    this.flowSystem.spawnLines(lines, this.board);
+                    let tiles = 0;
+                    lines.forEach(l => tiles += l.length);
+                    this.score += tiles * CONFIG.SCORE_PER_TILE * cascade;
+                };
+
+                this.selectedCell = null;
+                this.touchStartX = 0;
+                this.touchStartY = 0;
+            }
+
+            finish(victory) {
+                if (this.ended) return;
+                this.ended = true;
+                this.victory = victory;
+                this.endTimer = CONFIG.END_DELAY;
+                if (victory) AudioSys.playVictory();
+                else AudioSys.playDefeat();
+            }
+
+            update(deltaTime) {
+                this.board.update(deltaTime);
+                this.flowSystem.update(deltaTime);
+
+                if (this.ended) {
+                    this.endTimer -= deltaTime / 1000;
+                    if (this.endTimer <= 0 && this.onGameEnd) {
+                        const cb = this.onGameEnd;
+                        this.onGameEnd = null;
+                        cb({ victory: this.victory, score: this.score });
+                    }
+                    return;
+                }
+
+                this.elapsed += deltaTime / 1000;
+
+                if (this.difficulty.timeLimit > 0) {
+                    this.timeRemaining -= deltaTime / 1000;
+                    if (this.timeRemaining <= 0) {
+                        this.timeRemaining = 0;
+                        this.finish(false);
+                        return;
+                    }
+                }
+
+                if (this.difficulty.goal === 'altar' && this.flowSystem.altarProgress >= 1) {
+                    this.finish(true);
+                } else if (this.difficulty.goal === 'score' &&
+                           this.score >= this.difficulty.targetScore) {
+                    this.finish(true);
+                }
+            }
+
+            draw(ctx) {
+                Utils.clearScreen(ctx);
+
+                const hudH = Viewport.hudHeight;
+                const g = getAltarGeometry();
+                const progress = this.flowSystem.altarProgress;
+
+                // Алтарь
+                ctx.fillStyle = '#2c2c44';
+                ctx.fillRect(g.x, g.y, g.w, g.h);
+
+                if (progress > 0) {
+                    const grad = ctx.createLinearGradient(g.x, 0, g.x + g.w, 0);
+                    grad.addColorStop(0, '#4d94ff');
+                    grad.addColorStop(1, '#4dff88');
+                    ctx.fillStyle = grad;
+                    ctx.fillRect(g.x, g.y, g.w * progress, g.h);
+                }
+
+                if (progress >= 1) {
+                    ctx.shadowBlur = 4 + 3 * Math.sin(Date.now() / 200);
+                    ctx.shadowColor = '#4dff88';
+                }
+                ctx.strokeStyle = progress >= 1 ? '#4dff88' : '#4d94ff';
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(g.x, g.y, g.w, g.h);
+                ctx.shadowBlur = 0;
+
+                ctx.fillStyle = '#ffffff';
+                ctx.font = `${Math.floor(g.h * 0.55)}px Arial`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(
+                    progress >= 1 ? 'Алтарь полон! ✨' : 'Алтарь Стихий',
+                    g.x + g.w / 2, g.y + g.h / 2
+                );
+
+                // Кнопка звука
+                ctx.fillStyle = 'rgba(44, 44, 68, 0.9)';
+                ctx.fillRect(g.btnX, g.btnY, g.btnSize, g.btnSize);
+                ctx.strokeStyle = AudioSys.enabled ? '#4d94ff' : '#666688';
+                ctx.lineWidth = 1.5;
+                ctx.strokeRect(g.btnX, g.btnY, g.btnSize, g.btnSize);
+                ctx.font = `${Math.floor(g.btnSize * 0.55)}px "Noto Color Emoji", Arial, sans-serif`;
+                ctx.fillStyle = '#ffffff';
+                ctx.fillText(AudioSys.enabled ? '🔊' : '🔇',
+                    g.btnX + g.btnSize / 2, g.btnY + g.btnSize / 2);
+
+                // Очки, лёд, таймер
+                const infoY = (CONFIG.GRID_PADDING + g.h + hudH) / 2;
+                ctx.font = `${Math.floor(hudH * 0.17)}px Arial`;
+
+                ctx.textAlign = 'left';
+                let scoreText = `Очки: ${this.score}`;
+                if (this.difficulty.goal === 'score') {
+                    scoreText += ` / ${this.difficulty.targetScore}`;
+                }
+                ctx.fillStyle = '#ffffff';
+                ctx.fillText(scoreText, CONFIG.GRID_PADDING, infoY);
+
+                if (this.difficulty.frozenTiles > 0) {
+                    const frozen = this.board.countFrozen();
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = frozen > 0 ? '#a0d2ff' : '#4dff88';
+                    ctx.fillText(
+                        frozen > 0 ? `❄ ×${frozen}` : 'Лёд разбит! ✨',
+                        Viewport.width / 2, infoY
+                    );
+                }
+
+                ctx.textAlign = 'right';
+                if (this.difficulty.timeLimit > 0) {
+                    const t = Math.ceil(this.timeRemaining);
+                    ctx.fillStyle = t <= 10 ? '#ff4d4d' : '#ffffff';
+                    ctx.fillText(`⏱ ${t} сек`, Viewport.width - CONFIG.GRID_PADDING, infoY);
+                } else {
+                    ctx.fillStyle = '#8888aa';
+                    ctx.fillText('∞', Viewport.width - CONFIG.GRID_PADDING, infoY);
+                }
+                ctx.textBaseline = 'alphabetic';
+
+                this.board.draw(ctx);
+                this.flowSystem.draw(ctx);
+
+                if (this.ended) {
+                    ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+                    ctx.fillRect(0, 0, Viewport.width, Viewport.height);
+                    ctx.textAlign = 'center';
+                    ctx.fillStyle = this.victory ? '#4dff88' : '#ff4d4d';
+                    ctx.font = `bold ${Math.floor(Viewport.minDimension * 0.08)}px Arial`;
+                    ctx.fillText(
+                        this.victory ? 'Победа!' : 'Время вышло',
+                        Viewport.width / 2, Viewport.height / 2
+                    );
+                }
+            }
+
+            handleTouchStart(x, y) {
+                if (this.ended) return;
+                if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+
+                const g = getAltarGeometry();
+                if (Utils.hitRect(x, y, { x: g.btnX, y: g.btnY, w: g.btnSize, h: g.btnSize })) {
+                    AudioSys.toggle();
+                    return;
+                }
+
+                if (this.board.state !== BOARD_STATE.IDLE) return;
+
+                const cell = this.board.getCellFromPoint(x, y);
+                if (cell) {
+                    this.selectedCell = cell;
+                    this.board.selectedCell = cell;
+                    this.touchStartX = x;
+                    this.touchStartY = y;
+                }
+            }
+
+            handleTouchEnd(x, y) {
+                if (!this.selectedCell) return;
+                if (!Number.isFinite(x) || !Number.isFinite(y)) {
+                    this.board.selectedCell = null;
+                    this.selectedCell = null;
+                    return;
+                }
+
+                const dx = x - this.touchStartX;
+                const dy = y - this.touchStartY;
+                const threshold = CONFIG.SWAP_THRESHOLD;
+
+                this.board.selectedCell = null;
+
+                if (Math.abs(dx) < threshold && Math.abs(dy) < threshold) {
+                    this.selectedCell = null;
+                    return;
+                }
+
+                let targetRow = this.selectedCell.row;
+                let targetCol = this.selectedCell.col;
+
+                if (Math.abs(dx) > Math.abs(dy)) {
+                    targetCol += dx > 0 ? 1 : -1;
+                } else {
+                    targetRow += dy > 0 ? 1 : -1;
+                }
+
+                if (this.board.isValidCell(targetRow, targetCol)) {
+                    this.board.swapTiles(
+                        this.selectedCell.row, this.selectedCell.col,
+                        targetRow, targetCol
+                    );
+                }
+
+                this.selectedCell = null;
+            }
+        }
+
+        class ResultState extends GameState {
+            constructor(result, difficultyKey) {
+                super();
+                this.result = result;
+                this.difficultyKey = difficultyKey;
+                this.onRetry = null;
+                this.onMenu = null;
+            }
+
+            getButtons() {
+                const base = Viewport.minDimension;
+                const bw = Math.min(Viewport.width * 0.6, 280);
+                const bh = Math.max(50, Math.floor(base * 0.08));
+                const gap = Math.floor(bh * 0.4);
+                const cx = Viewport.width / 2;
+                const startY = Viewport.height * 0.55;
+                return [
+                    { id: 'retry', label: 'Ещё раз', color: '#4dff88',
+                      x: cx - bw / 2, y: startY, w: bw, h: bh },
+                    { id: 'menu', label: 'В меню', color: '#4d94ff',
+                      x: cx - bw / 2, y: startY + bh + gap, w: bw, h: bh }
+                ];
+            }
+
+            handleTap(x, y) {
+                for (const btn of this.getButtons()) {
+                    if (Utils.hitRect(x, y, btn)) {
+                        AudioSys.playTap();
+                        if (btn.id === 'retry' && this.onRetry) this.onRetry();
+                        if (btn.id === 'menu' && this.onMenu) this.onMenu();
+                        return;
+                    }
+                }
+            }
+
+            draw(ctx) {
+                Utils.clearScreen(ctx);
+                const base = Viewport.minDimension;
+                const cx = Viewport.width / 2;
+                const diff = DIFFICULTY[this.difficultyKey];
+
+                ctx.textAlign = 'center';
+
+                ctx.fillStyle = this.result.victory ? '#4dff88' : '#ff4d4d';
+                ctx.font = `bold ${Math.floor(base * 0.09)}px Arial`;
+                ctx.fillText(this.result.victory ? 'Победа! ✨' : 'Время вышло',
+                    cx, Viewport.height * 0.2);
+
+                ctx.fillStyle = '#aaaaaa';
+                ctx.font = `${Math.floor(base * 0.04)}px Arial`;
+                ctx.fillText(`Сложность: ${diff.name}`, cx, Viewport.height * 0.28);
+
+                ctx.fillStyle = '#ffffff';
+                ctx.font = `bold ${Math.floor(base * 0.06)}px Arial`;
+                ctx.fillText(`Очки: ${this.result.score}`, cx, Viewport.height * 0.38);
+
+                if (this.result.isRecord) {
+                    ctx.fillStyle = '#ffd700';
+                    ctx.font = `bold ${Math.floor(base * 0.045)}px Arial`;
+                    ctx.fillText('🏆 Новый рекорд!', cx, Viewport.height * 0.46);
+                }
+
+                this.getButtons().forEach(btn => {
+                    ctx.fillStyle = 'rgba(44, 44, 68, 0.9)';
+                    ctx.fillRect(btn.x, btn.y, btn.w, btn.h);
+                    ctx.strokeStyle = btn.color;
+                    ctx.lineWidth = 2;
+                    ctx.strokeRect(btn.x, btn.y, btn.w, btn.h);
+
+                    ctx.fillStyle = btn.color;
+                    ctx.textBaseline = 'middle';
+                    ctx.font = `bold ${Math.floor(btn.h * 0.38)}px Arial`;
+                    ctx.fillText(btn.label, btn.x + btn.w / 2, btn.y + btn.h / 2);
+                    ctx.textBaseline = 'alphabetic';
+                });
+            }
+        }
+
+        // ==========================================================
+        // МЕНЕДЖЕР СОСТОЯНИЙ
+        // ==========================================================
+        class GameManager {
+            constructor() {
+                this.states = { menu: new MenuState(), play: null, result: null };
+                this.currentStateName = 'menu';
+                this.difficultyKey = 'MAGE';
+
+                this.states.menu.onSelectDifficulty = (key) => this.startGame(key);
+            }
+
+            startGame(key) {
+                this.difficultyKey = key;
+                const play = new PlayState(DIFFICULTY[key]);
+                play.onGameEnd = (result) => this.endGame(result);
+                play.board.calculateLayout();
+                play.flowSystem.updateAltarPosition();
+                this.states.play = play;
+                this.currentStateName = 'play';
+            }
+
+            endGame(result) {
+                let isRecord = false;
+                try {
+                    const bestKey = 'best_' + this.difficultyKey;
+                    const prev = parseInt(localStorage.getItem(bestKey) || '0', 10);
+                    isRecord = result.score > prev && result.score > 0;
+                    if (isRecord) localStorage.setItem(bestKey, String(result.score));
+                } catch (e) {
+                    console.warn('localStorage недоступен:', e);
+                }
+
+                const res = new ResultState(
+                    { victory: result.victory, score: result.score, isRecord },
+                    this.difficultyKey
+                );
+                res.onRetry = () => this.startGame(this.difficultyKey);
+                res.onMenu = () => { this.currentStateName = 'menu'; };
+                this.states.result = res;
+                this.currentStateName = 'result';
+            }
+
+            get currentState() {
+                return this.states[this.currentStateName];
+            }
+        }
+
+        // ==========================================================
+        // ИНИЦИАЛИЗАЦИЯ
+        // ==========================================================
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+
+        Viewport.init(canvas);
+        const gameManager = new GameManager();
+
+        Viewport.onResize = () => {
+            if (gameManager.currentStateName === 'play') {
+                const ps = gameManager.currentState;
+                ps.board.calculateLayout();
+                ps.flowSystem.updateAltarPosition();
+            }
+        };
+
+        // Экономия батареи: приостановка аудио в фоне
+        document.addEventListener('visibilitychange', () => {
+            if (!AudioSys.ctx) return;
+            if (document.hidden) {
+                AudioSys.ctx.suspend();
+            } else {
+                AudioSys.ctx.resume();
+            }
+        });
+
+        function getEventCoords(e) {
+            const rect = canvas.getBoundingClientRect();
+            if (e.touches && e.touches.length > 0) {
+                return {
+                    x: e.touches[0].clientX - rect.left,
+                    y: e.touches[0].clientY - rect.top
+                };
+            }
+            if (e.changedTouches && e.changedTouches.length > 0) {
+                return {
+                    x: e.changedTouches[0].clientX - rect.left,
+                    y: e.changedTouches[0].clientY - rect.top
+                };
+            }
+            return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+        }
+
+        canvas.addEventListener('touchstart', (e) => {
+            if (e.cancelable) e.preventDefault();
+            AudioSys.init();
+            const { x, y } = getEventCoords(e);
+            const state = gameManager.currentState;
+            if (state.handleTouchStart) state.handleTouchStart(x, y);
+        }, { passive: false });
+
+        canvas.addEventListener('touchend', (e) => {
+            if (e.cancelable) e.preventDefault();
+            const { x, y } = getEventCoords(e);
+            const state = gameManager.currentState;
+            if (state.handleTouchEnd) state.handleTouchEnd(x, y);
+            else if (state.handleTap) state.handleTap(x, y);
+        }, { passive: false });
+
+        canvas.addEventListener('mousedown', (e) => {
+            AudioSys.init();
+            const { x, y } = getEventCoords(e);
+            const state = gameManager.currentState;
+            if (state.handleTouchStart) state.handleTouchStart(x, y);
+            else if (state.handleTap) state.handleTap(x, y);
+        });
+
+        canvas.addEventListener('mouseup', (e) => {
+            const { x, y } = getEventCoords(e);
+            const state = gameManager.currentState;
+            if (state.handleTouchEnd) state.handleTouchEnd(x, y);
+        });
+
+        // ==========================================================
+        // ИГРОВОЙ ЦИКЛ (requestAnimationFrame + deltaTime)
+        // ==========================================================
+        let lastTime = 0;
+
+        function gameLoop(timestamp) {
+            const deltaTime = (timestamp - lastTime) || 16;
+            lastTime = timestamp;
+
+            gameManager.currentState.update(deltaTime);
+            gameManager.currentState.draw(ctx);
+
+            requestAnimationFrame(gameLoop);
+        }
+
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+</html>
