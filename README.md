@@ -67,13 +67,3 @@ cordova build android
 | Игровой цикл | `requestAnimationFrame` + `deltaTime` |
 | Сохранения | `localStorage` (рекорды, настройки звука) |
 | Зависимости | **Отсутствуют** |
-
-## 📸 Скриншоты
-
-<!-- Добавьте сюда скриншоты игры, например:
-| Меню | Игровой процесс | Архимаг со льдом |
-|---|---|---|
-| ![menu](screens/menu.png) | ![game](screens/game.png) | ![ice](screens/ice.png) |
--->
-
-## 📂 Структура проекта
